@@ -329,7 +329,9 @@ static VALUE rb_connect(VALUE self, VALUE user, VALUE pass, VALUE host, VALUE po
   VALUE rv;
   GET_CLIENT(self);
   time_t start_time, end_time;
-  unsigned int elapsed_time, connect_timeout;
+  unsigned int elapsed_time;
+  unsigned int connect_timeout = wrapper->connect_timeout;
+  unsigned int attempt = 1;
 
   args.host = NIL_P(host) ? NULL : StringValuePtr(host);
   args.unix_socket = NIL_P(socket) ? NULL : StringValuePtr(socket);
@@ -354,6 +356,8 @@ static VALUE rb_connect(VALUE self, VALUE user, VALUE pass, VALUE host, VALUE po
         /* avoid an early timeout due to time truncating milliseconds off the start time */
         if (elapsed_time > 0)
             elapsed_time--;
+        printf("[MYSQL2] EINTR on connect (attempt=%u, elapsed_time=%lu, connect_timeout=%u, retrying=%s)\n",
+                attempt++, end_time - start_time, connect_timeout, (elapsed_time < wrapper->connect_timeout ? "Yes" : "No"));
         if (elapsed_time >= wrapper->connect_timeout)
           break;
         connect_timeout = wrapper->connect_timeout - elapsed_time;
