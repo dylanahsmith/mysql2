@@ -475,11 +475,20 @@ RSpec.describe Mysql2::Client do
     end
 
     if RUBY_PLATFORM !~ /mingw|mswin/
-      it "should not allow another query to be sent without fetching a result first" do
+      it "should not allow an non-async query after an async with without fetch the result first" do
         @client.query("SELECT 1", :async => true)
         expect {
           @client.query("SELECT 1")
         }.to raise_error(Mysql2::Error)
+      end
+
+      it "should allow sending two async queries before waiting for their result" do
+        @client.query("SELECT 1", :async => true)
+        @client.query("SELECT 2", :async => true)
+        result = @client.async_result
+        expect(result.first["1"]).to eq(1)
+        result = @client.async_result
+        expect(result.first["2"]).to eq(2)
       end
 
       it "should timeout if we wait longer than :read_timeout" do

@@ -37,16 +37,23 @@ rb_thread_call_without_gvl(
 #endif /* ! HAVE_RB_THREAD_CALL_WITHOUT_GVL */
 
 typedef struct {
+  unsigned int pkt_nr, compress_pkt_nr;
+} command_state;
+
+typedef struct {
   VALUE encoding;
   long server_version;
   int reconnect_enabled;
   unsigned int connect_timeout;
-  int active_queries;
   int automatic_close;
   int connected;
   int initialized;
   int refcount;
   int freed;
+  unsigned int active_queries;
+  unsigned int saved_queries_offset;
+  unsigned int saved_queries_size;
+  command_state *saved_queries;
   MYSQL *client;
 } mysql_client_wrapper;
 

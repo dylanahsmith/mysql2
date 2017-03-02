@@ -260,6 +260,50 @@ static VALUE invalidate_fd(int clientfd)
 }
 #endif /* _WIN32 */
 
+static void clear_active_queries(mysql_client_wrapper *wrapper) {
+  wrapper->active_queries = 0;
+  xfree(wrapper->saved_queries);
+  wrapper->saved_queries = NULL;
+  wrapper->saved_queries_offset = 0;
+  wrapper->saved_queries_size = 0;
+}
+
+static void save_query_state(mysql_client_wrapper *wrapper) {
+  if (wrapper->saved_queries_offset > 0 && wrapper->saved_queries_size - wrapper->saved_queries_offset < wrapper->active_queries) {
+    memmove(wrapper->saved_queries, wrapper->saved_queries + wrapper->saved_queries_offset + 1,
+        sizeof(*wrapper->saved_queries) * (wrapper->active_queries - 1));
+    wrapper->saved_queries_offset = 0;
+  }
+  if (wrapper->saved_queries_size < wrapper->active_queries) {
+    unsigned int new_size = wrapper->active_queries * 2;
+    wrapper->saved_queries = xrealloc(wrapper->saved_queries, sizeof(*wrapper->saved_queries) * new_size);
+    wrapper->saved_queries_size = new_size;
+  }
+  command_state* state = &wrapper->saved_queries[wrapper->active_queries + wrapper->saved_queries_offset - 1];
+  state->pkt_nr = wrapper->client->net.pkt_nr;
+  state->compress_pkt_nr = wrapper->client->net.compress_pkt_nr;
+}
+
+static void restore_query_state(mysql_client_wrapper *wrapper) {
+  command_state* state = wrapper->saved_queries + wrapper->saved_queries_offset;
+  wrapper->client->net.pkt_nr = state->pkt_nr;
+  wrapper->client->net.compress_pkt_nr = state->compress_pkt_nr;
+}
+
+static void remove_active_query(mysql_client_wrapper *wrapper) {
+  wrapper->active_queries -= 1;
+  if (wrapper->active_queries > 0) {
+    wrapper->saved_queries_offset += 1;
+    if (wrapper->active_queries == 1) {
+      restore_query_state(wrapper);
+      xfree(wrapper->saved_queries);
+      wrapper->saved_queries = NULL;
+      wrapper->saved_queries_offset = 0;
+      wrapper->saved_queries_size = 0;
+    }
+  }
+}
+
 static void *nogvl_close(void *ptr) {
   mysql_client_wrapper *wrapper = ptr;
 
@@ -268,7 +312,7 @@ static void *nogvl_close(void *ptr) {
     xfree(wrapper->client);
     wrapper->client = NULL;
     wrapper->connected = 0;
-    wrapper->active_queries = 0;
+    clear_active_queries(wrapper);
   }
 
   return NULL;
@@ -319,6 +363,9 @@ static VALUE allocate(VALUE klass) {
   wrapper->connected = 0; /* means that a database connection is open */
   wrapper->initialized = 0; /* means that that the wrapper is initialized */
   wrapper->refcount = 1;
+  wrapper->saved_queries_offset = 0;
+  wrapper->saved_queries_size = 0;
+  wrapper->saved_queries = NULL;
   wrapper->client = (MYSQL*)xmalloc(sizeof(MYSQL));
 
   return obj;
@@ -490,7 +537,7 @@ static VALUE do_send_query(void *args) {
   mysql_client_wrapper *wrapper = query_args->wrapper;
   if ((VALUE)rb_thread_call_without_gvl(nogvl_send_query, args, RUBY_UBF_IO, 0) == Qfalse) {
     /* an error occurred, the query is not active anymore */
-    wrapper->active_queries -= 1;
+    remove_active_query(wrapper);
     rb_raise_mysql2_error(wrapper);
   }
   return Qnil;
@@ -546,9 +593,12 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
     return Qnil;
 
   REQUIRE_CONNECTED(wrapper);
+  if (wrapper->active_queries > 1) {
+    restore_query_state(wrapper);
+  }
   if ((VALUE)rb_thread_call_without_gvl(nogvl_read_query_result, wrapper->client, RUBY_UBF_IO, 0) == Qfalse) {
-    /* an error occurred, mark this connection inactive */
-    wrapper->active_queries -= 1;
+    /* an error occurred, the query is not active anymore */
+    remove_active_query(wrapper);
     rb_raise_mysql2_error(wrapper);
   }
 
@@ -558,7 +608,7 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
   } else {
     result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
   }
-  wrapper->active_queries -= 1;
+  remove_active_query(wrapper);
 
   if (result == NULL) {
     if (mysql_errno(wrapper->client) != 0) {
@@ -585,7 +635,7 @@ struct async_query_args {
 static VALUE disconnect_and_raise(VALUE self, VALUE error) {
   GET_CLIENT(self);
 
-  wrapper->active_queries = 0;
+  clear_active_queries(wrapper);
   wrapper->connected = 0;
 
   /* Invalidate the MySQL socket to prevent further communication.
@@ -660,7 +710,7 @@ static VALUE finish_and_mark_inactive(struct finish_and_mark_inactive_args *args
     result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
     mysql_free_result(result);
 
-    wrapper->active_queries -= 1;
+    remove_active_query(wrapper);
   }
 
   return Qnil;
@@ -732,8 +782,14 @@ static VALUE rb_query(VALUE self, VALUE sql, VALUE current) {
   args.wrapper = wrapper;
 
   async = rb_hash_aref(current, sym_async) == Qtrue;
-  if (!async && wrapper->active_queries) {
-    rb_raise(cMysql2Error, "This connection is still waiting for a result, try again once you have the result");
+  if (wrapper->active_queries) {
+    if (!async) {
+      rb_raise(cMysql2Error, "This connection is still waiting for a result, try again once you have the result");
+    }
+    // first query is lazily stored to avoid overhead when only a single query is active at a time
+    if (wrapper->active_queries == 1) {
+      save_query_state(wrapper);
+    }
   }
   wrapper->active_queries += 1;
 
@@ -741,6 +797,9 @@ static VALUE rb_query(VALUE self, VALUE sql, VALUE current) {
   rb_rescue2(do_send_query, (VALUE)&args, disconnect_and_raise, self, rb_eException, (VALUE)0);
 
   if (async) {
+    if (wrapper->active_queries > 1) {
+      save_query_state(wrapper);
+    }
     return Qnil;
   } else {
     async_args.fd = wrapper->client->net.fd;
