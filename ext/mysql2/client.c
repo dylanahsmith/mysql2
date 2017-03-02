@@ -162,7 +162,6 @@ static void rb_mysql_client_mark(void * wrapper) {
   mysql_client_wrapper * w = wrapper;
   if (w) {
     rb_gc_mark(w->encoding);
-    rb_gc_mark(w->active_thread);
   }
 }
 
@@ -269,7 +268,7 @@ static void *nogvl_close(void *ptr) {
     xfree(wrapper->client);
     wrapper->client = NULL;
     wrapper->connected = 0;
-    wrapper->active_thread = Qnil;
+    wrapper->active_queries = 0;
   }
 
   return NULL;
@@ -312,7 +311,7 @@ static VALUE allocate(VALUE klass) {
   mysql_client_wrapper * wrapper;
   obj = Data_Make_Struct(klass, mysql_client_wrapper, rb_mysql_client_mark, rb_mysql_client_free, wrapper);
   wrapper->encoding = Qnil;
-  wrapper->active_thread = Qnil;
+  wrapper->active_queries = 0;
   wrapper->automatic_close = 1;
   wrapper->server_version = 0;
   wrapper->reconnect_enabled = 0;
@@ -490,8 +489,8 @@ static VALUE do_send_query(void *args) {
   struct nogvl_send_query_args *query_args = args;
   mysql_client_wrapper *wrapper = query_args->wrapper;
   if ((VALUE)rb_thread_call_without_gvl(nogvl_send_query, args, RUBY_UBF_IO, 0) == Qfalse) {
-    /* an error occurred, we're not active anymore */
-    wrapper->active_thread = Qnil;
+    /* an error occurred, the query is not active anymore */
+    wrapper->active_queries -= 1;
     rb_raise_mysql2_error(wrapper);
   }
   return Qnil;
@@ -519,10 +518,6 @@ static void *nogvl_do_result(void *ptr, char use_result) {
     result = mysql_store_result(wrapper->client);
   }
 
-  /* once our result is stored off, this connection is
-     ready for another command to be issued */
-  wrapper->active_thread = Qnil;
-
   return result;
 }
 
@@ -547,13 +542,13 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
   GET_CLIENT(self);
 
   /* if we're not waiting on a result, do nothing */
-  if (NIL_P(wrapper->active_thread))
+  if (!wrapper->active_queries)
     return Qnil;
 
   REQUIRE_CONNECTED(wrapper);
   if ((VALUE)rb_thread_call_without_gvl(nogvl_read_query_result, wrapper->client, RUBY_UBF_IO, 0) == Qfalse) {
     /* an error occurred, mark this connection inactive */
-    wrapper->active_thread = Qnil;
+    wrapper->active_queries -= 1;
     rb_raise_mysql2_error(wrapper);
   }
 
@@ -563,10 +558,10 @@ static VALUE rb_mysql_client_async_result(VALUE self) {
   } else {
     result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
   }
+  wrapper->active_queries -= 1;
 
   if (result == NULL) {
     if (mysql_errno(wrapper->client) != 0) {
-      wrapper->active_thread = Qnil;
       rb_raise_mysql2_error(wrapper);
     }
     /* no data and no error, so query was not a SELECT */
@@ -590,7 +585,7 @@ struct async_query_args {
 static VALUE disconnect_and_raise(VALUE self, VALUE error) {
   GET_CLIENT(self);
 
-  wrapper->active_thread = Qnil;
+  wrapper->active_queries = 0;
   wrapper->connected = 0;
 
   /* Invalidate the MySQL socket to prevent further communication.
@@ -650,43 +645,27 @@ static VALUE do_query(void *args) {
   return Qnil;
 }
 #else
-static VALUE finish_and_mark_inactive(void *args) {
-  VALUE self = args;
+struct finish_and_mark_inactive_args {
+  mysql_client_wrapper *wrapper;
+  int query_number;
+};
+
+static VALUE finish_and_mark_inactive(struct finish_and_mark_inactive_args *args) {
   MYSQL_RES *result;
 
-  GET_CLIENT(self);
-
-  if (!NIL_P(wrapper->active_thread)) {
+  if (args->wrapper->active_queries == args->query_number) {
     /* if we got here, the result hasn't been read off the wire yet
        so lets do that and then throw it away because we have no way
        of getting it back up to the caller from here */
     result = (MYSQL_RES *)rb_thread_call_without_gvl(nogvl_store_result, wrapper, RUBY_UBF_IO, 0);
     mysql_free_result(result);
 
-    wrapper->active_thread = Qnil;
+    wrapper->active_queries -= 1;
   }
 
   return Qnil;
 }
 #endif
-
-void rb_mysql_client_set_active_thread(VALUE self) {
-  VALUE thread_current = rb_thread_current();
-  GET_CLIENT(self);
-
-  // see if this connection is still waiting on a result from a previous query
-  if (NIL_P(wrapper->active_thread)) {
-    // mark this connection active
-    wrapper->active_thread = thread_current;
-  } else if (wrapper->active_thread == thread_current) {
-    rb_raise(cMysql2Error, "This connection is still waiting for a result, try again once you have the result");
-  } else {
-    VALUE inspect = rb_inspect(wrapper->active_thread);
-    const char *thr = StringValueCStr(inspect);
-
-    rb_raise(cMysql2Error, "This connection is in use by: %s", thr);
-  }
-}
 
 /* call-seq:
  *    client.abandon_results!
@@ -727,8 +706,11 @@ static VALUE rb_mysql_client_abandon_results(VALUE self) {
 static VALUE rb_query(VALUE self, VALUE sql, VALUE current) {
 #ifndef _WIN32
   struct async_query_args async_args;
+#else
+  struct finish_and_mark_inactive_args finish_args;
 #endif
   struct nogvl_send_query_args args;
+  int async;
   GET_CLIENT(self);
 
   REQUIRE_CONNECTED(wrapper);
@@ -749,12 +731,16 @@ static VALUE rb_query(VALUE self, VALUE sql, VALUE current) {
   args.sql_len = RSTRING_LEN(args.sql);
   args.wrapper = wrapper;
 
-  rb_mysql_client_set_active_thread(self);
+  async = rb_hash_aref(current, sym_async) == Qtrue;
+  if (!async && wrapper->active_queries) {
+    rb_raise(cMysql2Error, "This connection is still waiting for a result, try again once you have the result");
+  }
+  wrapper->active_queries += 1;
 
 #ifndef _WIN32
   rb_rescue2(do_send_query, (VALUE)&args, disconnect_and_raise, self, rb_eException, (VALUE)0);
 
-  if (rb_hash_aref(current, sym_async) == Qtrue) {
+  if (async) {
     return Qnil;
   } else {
     async_args.fd = wrapper->client->net.fd;
@@ -768,7 +754,9 @@ static VALUE rb_query(VALUE self, VALUE sql, VALUE current) {
   do_send_query(&args);
 
   /* this will just block until the result is ready */
-  return rb_ensure(rb_mysql_client_async_result, self, finish_and_mark_inactive, self);
+  finish_args.wrapper = wrapper;
+  finish_args.query_number = wrapper->active_queries;
+  return rb_ensure(rb_mysql_client_async_result, self, finish_and_mark_inactive, &finish_args);
 #endif
 }
 

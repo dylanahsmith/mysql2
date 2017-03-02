@@ -422,7 +422,6 @@ static VALUE execute(int argc, VALUE *argv, VALUE self) {
   if (metadata == NULL) {
     if (mysql_stmt_errno(stmt) != 0) {
       // either CR_OUT_OF_MEMORY or CR_UNKNOWN_ERROR. both fatal.
-      wrapper->active_thread = Qnil;
       rb_raise_mysql2_stmt_error(stmt_wrapper);
     }
     // no data and no error, so query was not a SELECT
@@ -440,7 +439,6 @@ static VALUE execute(int argc, VALUE *argv, VALUE self) {
       mysql_free_result(metadata);
       rb_raise_mysql2_stmt_error(stmt_wrapper);
     }
-    wrapper->active_thread = Qnil;
   }
 
   resultObj = rb_mysql_result_to_obj(stmt_wrapper->client, wrapper->encoding, current, metadata, self);

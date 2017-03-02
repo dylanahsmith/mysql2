@@ -482,13 +482,6 @@ RSpec.describe Mysql2::Client do
         }.to raise_error(Mysql2::Error)
       end
 
-      it "should describe the thread holding the active query" do
-        thr = Thread.new { @client.query("SELECT 1", :async => true) }
-
-        thr.join
-        expect { @client.query('SELECT 1') }.to raise_error(Mysql2::Error, Regexp.new(Regexp.escape(thr.inspect)))
-      end
-
       it "should timeout if we wait longer than :read_timeout" do
         client = Mysql2::Client.new(DatabaseCredentials['root'].merge(:read_timeout => 0))
         expect {

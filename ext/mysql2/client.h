@@ -38,11 +38,10 @@ rb_thread_call_without_gvl(
 
 typedef struct {
   VALUE encoding;
-  VALUE active_thread; /* rb_thread_current() or Qnil */
   long server_version;
   int reconnect_enabled;
   unsigned int connect_timeout;
-  int active;
+  int active_queries;
   int automatic_close;
   int connected;
   int initialized;
@@ -50,8 +49,6 @@ typedef struct {
   int freed;
   MYSQL *client;
 } mysql_client_wrapper;
-
-void rb_mysql_client_set_active_thread(VALUE self);
 
 #define GET_CLIENT(self) \
   mysql_client_wrapper *wrapper; \
